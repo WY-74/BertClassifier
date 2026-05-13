@@ -1,9 +1,10 @@
+import os
 import math
 import torch
 from torch import nn
 from torch.optim import lr_scheduler
 from utils import set_axes, init_figsize
-from utils import accuracy, evaluate_accuracy_gpu
+from utils import accuracy, evaluate_accuracy_gpu, try_all_gpus
 from utils import Timer, Animator, Accumulator
 
 
@@ -14,19 +15,12 @@ class _Train:
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-    def _try_all_gpus(self):
-        """返回所有可用的GPU，如果没有GPU，则返回[]"""
-        device_count = torch.cuda.device_count()
-        if device_count == 0:
-            return None
-        return [torch.device(f'cuda:{i}') for i in range(device_count)]
-
     def _init_net(self, net, jit_script: bool = False):
         net.apply(self.init_weights)
         if jit_script:
             net = torch.jit.script(net)
 
-        self.devices = self._try_all_gpus()
+        self.devices = try_all_gpus()
         self.device = self.devices[0] if self.devices is not None else "cpu"
         if self.devices is not None:
             if len(self.devices) > 1:
@@ -135,7 +129,16 @@ class _CosineScheduler:
 
 
 def train(
-    net, train_iter, test_iter, num_epochs, max_update, final_lr, warmup_steps, lr={"bert": 2e-5, "outputs": 1e-4}
+    net,
+    train_iter,
+    test_iter,
+    num_epochs,
+    max_update,
+    final_lr,
+    warmup_steps,
+    lr={"bert": 2e-5, "outputs": 1e-4},
+    with_scheduler=True,
+    class_weights=None,
 ):
     params_1x = [param for name, param in net.named_parameters() if "bert" in name]
     optimizer = torch.optim.SGD(
@@ -145,9 +148,15 @@ def train(
         ],
         momentum=0.9,
     )
-    scheduler = _CosineScheduler(max_update, optimizer.param_groups, final_lr=final_lr, warmup_steps=warmup_steps)
-    loss = nn.CrossEntropyLoss(reduction='none')
+    if with_scheduler:
+        scheduler = _CosineScheduler(max_update, optimizer.param_groups, final_lr=final_lr, warmup_steps=warmup_steps)
+    else:
+        scheduler = None
+
+    device = try_all_gpus()[0] if try_all_gpus() else "cpu"
+    class_weights = class_weights.to(device)
+    loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
 
     _FineTuningBertBase(net, loss, optimizer, scheduler).train_epochs(num_epochs, train_iter, test_iter)
-
-    torch.save(net.state_dict(), "fine-tuning-bert.pth")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    torch.save(net.state_dict(), f"{current_dir}/fine-tuning-bert.pth")

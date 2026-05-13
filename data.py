@@ -2,10 +2,12 @@ import os
 import json
 import torch
 import multiprocessing
+import numpy as np
 from pathlib import Path
 from collections import Counter
 from transformers import BertTokenizer
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from sklearn.utils.class_weight import compute_class_weight
 
 __all__ = ['load_news_category']
 
@@ -24,7 +26,7 @@ class _NewsCategoryDataset(Dataset):
         return len(self.all_token_ids)
 
     def _init_dataset(self):
-        dataset = self._load_news_category_dataset()
+        dataset = _load_news_category_dataset(self.fpath)
         label_set = {}
 
         # features
@@ -39,26 +41,6 @@ class _NewsCategoryDataset(Dataset):
         labels = list(map(lambda key: label_set[key], labels))
 
         return all_token_ids, all_segments, all_attention_mask, torch.tensor(labels)
-
-    def _load_news_category_dataset(self):
-        # load News_Category_Dataset_v3.json
-        features, labels = [], []  # short_description, category
-        with open(self.fpath, 'r', encoding='utf-8') as file:
-            for line in file:
-                line = json.loads(line)
-                short_description = self._format(line["short_description"])
-                if len(short_description) == 0:
-                    continue
-                features.append(short_description)
-                labels.append(line["category"])
-        return features, labels
-
-    def _format(self, line):
-        line = line.replace("\'", "'")
-        line = line.replace('“', '"').replace('”', '"').strip()
-        if line.startswith('"') and line.endswith('"'):
-            line = line[1:-1]
-        return line
 
     def _save_label_set(self, label_set):
         with open(self.fpath.parent / "label_set.json", "w", encoding="utf-8") as f:
@@ -117,7 +99,28 @@ def _split_new_category_dataset(fpath: Path, fname: str):
         f.write("".join(test))
 
 
-def load_news_category(fpath: str, local_model_path: str, batch_size: int):
+def _load_news_category_dataset(fpath: Path):
+    def _format(line):
+        line = line.replace("\'", "'")
+        line = line.replace('“', '"').replace('”', '"').strip()
+        if line.startswith('"') and line.endswith('"'):
+            line = line[1:-1]
+        return line
+
+    # load News_Category_Dataset_v3.json
+    features, labels = [], []  # short_description, category
+    with open(fpath, 'r', encoding='utf-8') as file:
+        for line in file:
+            line = json.loads(line)
+            short_description = _format(line["short_description"])
+            if len(short_description) == 0:
+                continue
+            features.append(short_description)
+            labels.append(line["category"])
+    return features, labels
+
+
+def load_news_category(fpath: str, local_model_path: str, batch_size: int, class_weights=False):
     """
     ARGS:
         - fpath: path to News_Category_Dataset_v3.json
@@ -140,8 +143,21 @@ def load_news_category(fpath: str, local_model_path: str, batch_size: int):
     tokenizer = BertTokenizer.from_pretrained(local_model_path)
 
     train_set = _NewsCategoryDataset(fpath.parent / f"{fname}_train.json", tokenizer)
-    train_iter = torch.utils.data.DataLoader(train_set, batch_size, shuffle=True, num_workers=num_workers)
+    train_iter = DataLoader(train_set, batch_size, shuffle=True, num_workers=num_workers)
     test_set = _NewsCategoryDataset(fpath.parent / f"{fname}_test.json", tokenizer)
-    test_iter = torch.utils.data.DataLoader(test_set, batch_size, shuffle=False, num_workers=num_workers)
+    test_iter = DataLoader(test_set, batch_size, shuffle=False, num_workers=num_workers)
 
-    return train_iter, test_iter
+    if not class_weights:
+        return train_iter, test_iter
+    else:
+        _, labels = _load_news_category_dataset(fpath.parent / f"{fname}_train.json")
+
+        # read label_set.json
+        with open(fpath.parent / "label_set.json", "r", encoding="utf-8") as f:
+            label_set = json.load(f)
+        labels = list(map(lambda key: label_set[key], labels))
+
+        class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
+        class_weights = torch.tensor(class_weights, dtype=torch.float)
+
+        return train_iter, test_iter, class_weights

@@ -6,12 +6,12 @@ __all__ = ["BERTClassifier"]
 
 
 class BERTClassifier(nn.Module):
-    def __init__(self, local_model_path: str, num_hiddens: int = 256, num_classes: int = 42):
+    def __init__(self, local_model_path: str, num_hiddens: int = 256, num_classes: int = 42, dropout: float = 0.5):
         super().__init__()
         self.bert = BertModel.from_pretrained(local_model_path)
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(dropout)
         self.output = nn.Sequential(
-            nn.Linear(768, num_hiddens), nn.ReLU(), nn.Dropout(0.2), nn.Linear(num_hiddens, num_classes)
+            nn.Linear(768, num_hiddens), nn.ReLU(), nn.Dropout(dropout), nn.Linear(num_hiddens, num_classes)
         )
 
     def forward(self, tokens_X, segments_X, valid_lens_X):

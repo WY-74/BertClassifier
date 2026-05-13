@@ -53,6 +53,14 @@ def evaluate_accuracy_gpu(net, data_iter, device=None):
     return metric[0] / metric[1]
 
 
+def try_all_gpus():
+    """返回所有可用的GPU，如果没有GPU，则返回[]"""
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        return None
+    return [torch.device(f'cuda:{i}') for i in range(device_count)]
+
+
 class Animator:
     def __init__(
         self,
