@@ -32,17 +32,6 @@ class _Train:
             self.devices = ["cpu"]
         return net
 
-    def grad_clipping(self, theta):
-        if isinstance(self.net, nn.Module):
-            params = [p for p in self.net.parameters() if p.requires_grad]
-        else:
-            params = self.net.params
-
-        norm = torch.sqrt(sum(torch.sum((p.grad**2)) for p in params))
-        if norm > theta:
-            for param in params:
-                param.grad[:] *= theta / norm
-
     def init_weights(self, m):
         return
 
@@ -54,11 +43,11 @@ class _FineTuningBertBase(_Train):
     def train_epochs(self, num_epochs, train_iter, test_iter):
         timer, num_batches = Timer(), len(train_iter)
         animator = Animator(
-            xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1], legend=['train loss', 'train acc', 'test acc']
+            xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1], legend=['train loss', 'test acc']
         )
         for epoch in range(num_epochs):
             self.net.train()
-            metric = Accumulator(4)
+            metric = Accumulator(3)
             for i, (features, labels) in enumerate(train_iter):
                 timer.start()
                 if isinstance(features, list):
@@ -68,20 +57,21 @@ class _FineTuningBertBase(_Train):
                 y = labels.to(self.device)
 
                 self.optimizer.zero_grad()
-                pred = self.net(*X)
-                l = self.loss(pred, y)
-                l.sum().backward()
+                pred = self.net(*X, y)
+                l = self.loss(pred, y) # mean
+                l.backward()
+                nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 self.optimizer.step()
 
-                train_loss_sum = l.sum()
-                train_acc_sum = accuracy(pred, y)
-                metric.add(train_loss_sum, train_acc_sum, labels.shape[0], labels.numel())
+                # train_loss_sum = l.sum()
+                # train_acc_sum = accuracy(pred, y)
+                metric.add(l, 1, labels.numel())
                 timer.stop()
 
                 if (i + 1) % (num_batches // 5) == 0 or i == num_batches - 1:
-                    animator.add(epoch + (i + 1) / num_batches, (metric[0] / metric[2], metric[1] / metric[3], None))
+                    animator.add(epoch + (i + 1) / num_batches, (metric[0] / metric[1], None))
             test_acc = evaluate_accuracy_gpu(self.net, test_iter, self.device)
-            animator.add(epoch + 1, (None, None, test_acc))
+            animator.add(epoch + 1, (None, test_acc))
 
             if self.scheduler:
                 if self.scheduler.__module__ == lr_scheduler.__name__:
@@ -90,7 +80,7 @@ class _FineTuningBertBase(_Train):
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = self.scheduler(epoch, param_group)
 
-        print(f'loss {metric[0] / metric[2]:.3f}, train acc ' f'{metric[1] / metric[3]:.3f}, test acc {test_acc:.3f}')
+        print(f'loss {metric[0] / metric[1]:.3f}, test acc {test_acc:.3f}')
         print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on ' f'{str(self.devices)}')
 
 
@@ -130,33 +120,14 @@ class _CosineScheduler:
 
 def train(
     net,
+    loss,
+    optimizer,
     train_iter,
     test_iter,
     num_epochs,
-    max_update,
-    final_lr,
-    warmup_steps,
-    lr={"bert": 2e-5, "outputs": 1e-4},
-    with_scheduler=True,
-    class_weights=None,
+    lr,
+    scheduler=None,
 ):
-    params_1x = [param for name, param in net.named_parameters() if "bert" in name]
-    optimizer = torch.optim.SGD(
-        [
-            {'name': 'bert', 'params': params_1x, 'lr': lr["bert"]},
-            {'name': 'outputs', 'params': net.output.parameters(), "lr": lr["outputs"]},
-        ],
-        momentum=0.9,
-    )
-    if with_scheduler:
-        scheduler = _CosineScheduler(max_update, optimizer.param_groups, final_lr=final_lr, warmup_steps=warmup_steps)
-    else:
-        scheduler = None
-
-    device = try_all_gpus()[0] if try_all_gpus() else "cpu"
-    class_weights = class_weights.to(device)
-    loss = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
-
     _FineTuningBertBase(net, loss, optimizer, scheduler).train_epochs(num_epochs, train_iter, test_iter)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     torch.save(net.state_dict(), f"{current_dir}/fine-tuning-bert.pth")
