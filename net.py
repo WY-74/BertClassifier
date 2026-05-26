@@ -1,4 +1,7 @@
+import torch
+
 from torch import nn
+from torch.nn import functional as F
 from transformers import BertModel
 
 
@@ -29,6 +32,7 @@ class BERTClassifier(nn.Module):
         lam = torch.distributions.Beta(alpha, alpha).sample()
         
         index = torch.randperm(batch_size)  # 随机打乱
+        labels = F.one_hot(labels, num_classes=42).float()
         
         mixed_embeddings = lam * embeddings + (1 - lam) * embeddings[index]
         mixed_labels = lam * labels + (1 - lam) * labels[index]

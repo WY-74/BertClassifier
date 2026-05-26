@@ -16,7 +16,7 @@ class _Train:
         self.scheduler = scheduler
 
     def _init_net(self, net, jit_script: bool = False):
-        net.apply(self.init_weights)
+        net.output.apply(self.init_weights)
         if jit_script:
             net = torch.jit.script(net)
 
@@ -40,14 +40,18 @@ class _Train:
 
 
 class _FineTuningBertBase(_Train):
+    def init_weights(self, m):
+        if type(m) == nn.Linear:
+            nn.init.kaiming_uniform_(m.weight)
+        
     def train_epochs(self, num_epochs, train_iter, test_iter):
         timer, num_batches = Timer(), len(train_iter)
         animator = Animator(
-            xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1], legend=['train loss', 'test acc']
+            xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1], legend=['train loss', 'train acc', 'test acc']
         )
         for epoch in range(num_epochs):
             self.net.train()
-            metric = Accumulator(3)
+            metric = Accumulator(4)
             for i, (features, labels) in enumerate(train_iter):
                 timer.start()
                 if isinstance(features, list):
@@ -57,21 +61,20 @@ class _FineTuningBertBase(_Train):
                 y = labels.to(self.device)
 
                 self.optimizer.zero_grad()
-                pred = self.net(*X, y)
+                pred = self.net(*X)
                 l = self.loss(pred, y) # mean
                 l.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 self.optimizer.step()
 
-                # train_loss_sum = l.sum()
-                # train_acc_sum = accuracy(pred, y)
-                metric.add(l, 1, labels.numel())
+                train_acc_sum = accuracy(pred, y)
+                metric.add(l, train_acc_sum, 1, labels.numel())
                 timer.stop()
 
                 if (i + 1) % (num_batches // 5) == 0 or i == num_batches - 1:
-                    animator.add(epoch + (i + 1) / num_batches, (metric[0] / metric[1], None))
+                    animator.add(epoch + (i + 1) / num_batches, (metric[0] / metric[2], metric[1] / metric[3], None))
             test_acc = evaluate_accuracy_gpu(self.net, test_iter, self.device)
-            animator.add(epoch + 1, (None, test_acc))
+            animator.add(epoch + 1, (None, None, test_acc))
 
             if self.scheduler:
                 if self.scheduler.__module__ == lr_scheduler.__name__:
@@ -80,7 +83,7 @@ class _FineTuningBertBase(_Train):
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = self.scheduler(epoch, param_group)
 
-        print(f'loss {metric[0] / metric[1]:.3f}, test acc {test_acc:.3f}')
+        print(f'loss {metric[0] / metric[2]:.3f}, train acc {metric[1] / metric[3]}, test acc {test_acc:.3f}')
         print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on ' f'{str(self.devices)}')
 
 
