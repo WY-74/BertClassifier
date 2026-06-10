@@ -1,23 +1,158 @@
 import os
 import json
+import click
 import torch
-import multiprocessing
+import random
+
 import numpy as np
+import multiprocessing as mp
+import nlpaug.augmenter.word as naw
+
+from tqdm import tqdm
 from pathlib import Path
 from collections import Counter
-from transformers import BertTokenizer
-from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, pipeline
+from torch.utils.data import Dataset
 from sklearn.utils.class_weight import compute_class_weight
 
-__all__ = ['load_news_category']
+__all__ = ["LoadDataset"]
 
 
-class _NewsCategoryDataset(Dataset):
-    def __init__(self, fpath: str, tokenizer: BertTokenizer):
-        self.fpath = Path(fpath)
+def get_lable_map(fpath, labels):
+    """记录babel与idx对应关系"""
+    label_map = {}
+
+    # save
+    for idx, label in enumerate(sorted(set(labels))):
+        label_map[label] = idx
+    with open(fpath.parent / "label_map.json", "w", encoding="utf-8") as f:
+        json.dump(label_map, f, ensure_ascii=False, indent=4)
+
+    return label_map
+
+
+def split_dataset(features, labels):
+    """拆分得到训练集和验证集"""
+    # Count the original labels
+    labels_count = dict(Counter(labels))
+
+    # split dataset
+    train_features, train_labels, test_features, test_labels = [], [], [], []
+    vel_count = {
+        key: int(labels_count[key] * 0.1) for key in labels_count
+    }  # 此处有缺陷: 如果数量为个位数会有问题，在 News_Category_Dataset_v3 未体现
+    _vel_count = {key: 0 for key in vel_count}
+
+    for idx, label in enumerate(labels):
+        if _vel_count[label] <= vel_count[label]:
+            test_features.append(features[idx])
+            test_labels.append(label)
+            _vel_count[label] += 1
+        else:
+            train_features.append(features[idx])
+            train_labels.append(label)
+
+    return train_features, train_labels, test_features, test_labels
+
+
+def format_short_description(line):
+    line = line.replace("\'", "'")
+    line = line.replace('“', '"').replace('”', '"').strip()
+    if line.startswith('"') and line.endswith('"'):
+        line = line[1:-1]
+    return line
+
+
+def parse_dataset(fpath: Path, tokenizer: str):
+    """读取 News_Category_Dataset_v3.json 将其拆分为训练集和验证集，并保存为 pt 文件。"""
+    fname = fpath.stem
+    if fpath.name != "News_Category_Dataset_v3.json":
+        raise ValueError("请指定 News_Category_Dataset_v3.json 具体路径。")
+
+    # 读取 features & labels
+    all_features, all_labels = [], []
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = json.loads(line)
+            short_description = format_short_description(line["short_description"])
+            if len(short_description) == 0:
+                continue
+            all_features.append(short_description)
+            all_labels.append(line["category"])
+
+    label_map = get_lable_map(fpath, all_labels)
+    train_features, train_labels, test_features, test_labels = split_dataset(all_features, all_labels)
+
+    # train dataset
+    train_set = NewsCategoryDataset((train_features, train_labels), tokenizer, label_map)
+    torch.save(
+        {
+            "token_ids": train_set.all_token_ids,
+            "segments": train_set.all_segments,
+            "attention_mask": train_set.all_attention_mask,
+            "labels": train_set.labels,
+        },
+        fpath.parent / "train.pt",
+    )
+
+    # test dataset
+    test_set = NewsCategoryDataset((test_features, test_labels), tokenizer, label_map)
+    torch.save(
+        {
+            "token_ids": test_set.all_token_ids,
+            "segments": test_set.all_segments,
+            "attention_mask": test_set.all_attention_mask,
+            "labels": test_set.labels,
+        },
+        fpath.parent / "test.pt",
+    )
+
+    # class weights
+    all_labels_idx = list(map(lambda key: label_map[key], all_labels))
+
+    class_weights = compute_class_weight('balanced', classes=np.unique(all_labels_idx), y=all_labels_idx)
+    class_weights = torch.tensor(class_weights, dtype=torch.float)
+
+    torch.save(class_weights, fpath.parent / "class_weights.pt")
+
+
+@click.command()
+@click.option('-f', '--fpath', help='News_Category_Dataset_v3.json 文件完整路径')
+@click.option('-t', '--tokenizer', help='bert-base-uncased 目录')
+def main(fpath, tokenizer):
+    mp.set_start_method('spawn', force=True)
+    parse_dataset(Path(fpath), tokenizer)
+
+
+class EDA:
+    def __init__(self, back_translate_prob=0.2):
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.en2zh = pipeline("translation", model="/root/models/opus-mt-en-zh", device=device)
+        self.zh2en = pipeline("translation", model="/root/models/opus-mt-zh-en", device=device)
+        self.back_translate_prob = back_translate_prob
+
+    def __call__(self, feature):
+        if random.random() < self.back_translate_prob:
+            zh_text = self.en2zh(feature)[0]['translation_text']
+            return self.zh2en(zh_text)[0]['translation_text']
+
+        op = random.choice(["None", "delete", "swap"])
+        if op == "None":
+            return feature
+        else:
+            aug = naw.RandomWordAug(action=op, aug_min=2, aug_max=5)
+        return aug.augment(feature)[0]
+
+
+class NewsCategoryDataset(Dataset):
+    def __init__(self, dataset: tuple[list, list], tokenizer: str, label_map: dict, is_train: bool = True):
+        self.features, self.labels = dataset
         self.tokenizer = tokenizer
-        self.max_len = 40
-        self.all_token_ids, self.all_segments, self.all_attention_mask, self.labels = self._init_dataset()
+        self.label_map = label_map
+        self.is_train = is_train
+        self.eda = None
+
+        self.all_token_ids, self.all_segments, self.all_attention_mask, self.labels = self.init_dataset()
 
     def __getitem__(self, idx):
         return (self.all_token_ids[idx], self.all_segments[idx], self.all_attention_mask[idx]), self.labels[idx]
@@ -25,139 +160,89 @@ class _NewsCategoryDataset(Dataset):
     def __len__(self):
         return len(self.all_token_ids)
 
-    def _init_dataset(self):
-        dataset = _load_news_category_dataset(self.fpath)
-        label_set = {}
-
+    def init_dataset(self):
         # features
-        features = dataset[0]
-        all_token_ids, all_segments, all_attention_mask = self._preprocess(features)
+        all_token_ids, all_segments, all_attention_mask, all_labels = self._preprocess(self.features, self.labels)
 
         # labels
-        labels = dataset[-1]
-        for idx, label in enumerate(sorted(set(labels))):
-            label_set[label] = idx
-        self._save_label_set(label_set)
-        labels = list(map(lambda key: label_set[key], labels))
+        all_labels = list(map(lambda key: self.label_map[key], all_labels))
 
-        return all_token_ids, all_segments, all_attention_mask, torch.tensor(labels)
+        return all_token_ids, all_segments, all_attention_mask, torch.tensor(all_labels)
 
-    def _save_label_set(self, label_set):
-        with open(self.fpath.parent / "label_set.json", "w", encoding="utf-8") as f:
-            json.dump(label_set, f, ensure_ascii=False, indent=4)
-
-    def _preprocess(self, features):
-        pool = multiprocessing.Pool(4)
-        out = pool.map(self._mp_worker, features)
-
+    def _preprocess(self, features, labels):
         all_token_ids = []
         all_segments = []
         all_attention_mask = []
-        for token_ids, segments, attention_mask in out:
-            all_token_ids.append(token_ids)
-            all_segments.append(segments)
-            all_attention_mask.append(attention_mask)
+        all_labels = []
+
+        with mp.Pool(processes=4, initializer=self._init_worker, initargs=(self.tokenizer, self.is_train)) as pool:
+            results = list(
+                tqdm(pool.imap(self._worker_without_eda, features), total=len(features), desc="Preprocessing")
+            )
+
+        _all_token_ids, _all_segments, _all_attention_mask = zip(*results)
+
+        for idx, value in enumerate(_all_token_ids):
+            all_token_ids.extend(value)
+            all_segments.extend(_all_segments[idx])
+            all_attention_mask.extend(_all_attention_mask[idx])
+            all_labels.extend([labels[idx]] * len(value))
+
         return (
             torch.tensor(all_token_ids, dtype=torch.long),
             torch.tensor(all_segments, dtype=torch.long),
             torch.tensor(all_attention_mask, dtype=torch.long),
+            all_labels,
         )
 
-    def _mp_worker(self, feature):
-        out = self.tokenizer(feature, truncation=True, padding='max_length', max_length=self.max_len)
+    @staticmethod
+    def _init_worker(tokenizer, is_train):
+        global worker_eda, worker_tokenizer, worker_max_len, work_is_train
+
+        worker_eda = EDA(back_translate_prob=0.1)
+        worker_tokenizer = BertTokenizer.from_pretrained(tokenizer)
+        worker_max_len = 40
+        work_is_train = is_train
+
+    @staticmethod
+    def _worker_func(feature):
+        global worker_eda, worker_tokenizer, worker_max_len, work_is_train
+
+        _feature = [feature]
+
+        if work_is_train:
+            new_feature = worker_eda(feature)
+            if new_feature != feature:
+                _feature.append(new_feature)
+
+        out = worker_tokenizer(_feature, truncation=True, padding='max_length', max_length=worker_max_len)
+        return out["input_ids"], out["token_type_ids"], out["attention_mask"]
+
+    @staticmethod
+    def _worker_without_eda(feature):
+        global worker_eda, worker_tokenizer, worker_max_len
+
+        _feature = [feature]  # 保持与有eda时一致，会影响输出
+
+        out = worker_tokenizer(_feature, truncation=True, padding='max_length', max_length=worker_max_len)
         return out["input_ids"], out["token_type_ids"], out["attention_mask"]
 
 
-def _split_new_category_dataset(fpath: Path, fname: str):
-    # Count the original labels
-    labels = []
-    with open(fpath, 'r', encoding='utf-8') as file:
-        for idx, line in enumerate(file):
-            line = json.loads(line)
-            if len(line["short_description"]) == 0:
-                continue
-            labels.append(line["category"])
-    labels_count = dict(Counter(labels))
+class LoadDataset(Dataset):
+    def __init__(self, data):
+        self.all_token_ids = data["token_ids"]
+        self.all_segments = data["segments"]
+        self.all_attention_mask = data["attention_mask"]
+        self.labels = data["labels"]
 
-    # split dataset
-    train, test = [], []
-    vel_count = {key: int(labels_count[key] * 0.1) for key in labels_count}
-    _vel_count = {key: 0 for key in vel_count}
-    with open(fpath, 'r', encoding='utf-8') as file:
-        for line in file:
-            label = json.loads(line)["category"]
-            if _vel_count[label] <= vel_count[label]:
-                test.append(line)
-                _vel_count[label] += 1
-            else:
-                train.append(line)
+    def __getitem__(self, idx):
+        return (self.all_token_ids[idx], self.all_segments[idx], self.all_attention_mask[idx]), self.labels[idx]
 
-    # save
-    with open(fpath.parent / f"{fname}_train.json", "w", encoding="utf-8") as f:
-        f.write("".join(train))
-    with open(fpath.parent / f"{fname}_test.json", "w", encoding="utf-8") as f:
-        f.write("".join(test))
+    def __len__(self):
+        return len(self.all_token_ids)
 
 
-def _load_news_category_dataset(fpath: Path):
-    def _format(line):
-        line = line.replace("\'", "'")
-        line = line.replace('“', '"').replace('”', '"').strip()
-        if line.startswith('"') and line.endswith('"'):
-            line = line[1:-1]
-        return line
-
-    # load News_Category_Dataset_v3.json
-    features, labels = [], []  # short_description, category
-    with open(fpath, 'r', encoding='utf-8') as file:
-        for line in file:
-            line = json.loads(line)
-            short_description = _format(line["short_description"])
-            if len(short_description) == 0:
-                continue
-            features.append(short_description)
-            labels.append(line["category"])
-    return features, labels
-
-
-def load_news_category(fpath: str, local_model_path: str, batch_size: int, class_weights=False):
-    """
-    ARGS:
-        - fpath: path to News_Category_Dataset_v3.json
-    """
-    fpath = Path(fpath)
-    fname = fpath.stem
-    if fpath.suffix != ".json":
-        raise ValueError("We only accept JSON files.")
-    split_dataset = True
-    num_workers = os.cpu_count() // 2
-
-    for item in fpath.parent.iterdir():
-        if item.name == f"{fname}_train.json" or item.name == f"{fname}_test.json":
-            split_dataset = False
-            break
-    if split_dataset:
-        _split_new_category_dataset(fpath, fname)
-        print(f"Split {fname}_train.json and {fname}_text.json from {fname}")
-
-    tokenizer = BertTokenizer.from_pretrained(local_model_path)
-
-    train_set = _NewsCategoryDataset(fpath.parent / f"{fname}_train.json", tokenizer)
-    train_iter = DataLoader(train_set, batch_size, shuffle=True, num_workers=num_workers)
-    test_set = _NewsCategoryDataset(fpath.parent / f"{fname}_test.json", tokenizer)
-    test_iter = DataLoader(test_set, batch_size, shuffle=False, num_workers=num_workers)
-
-    if not class_weights:
-        return train_iter, test_iter
-    else:
-        _, labels = _load_news_category_dataset(fpath.parent / f"{fname}_train.json")
-
-        # read label_set.json
-        with open(fpath.parent / "label_set.json", "r", encoding="utf-8") as f:
-            label_set = json.load(f)
-        labels = list(map(lambda key: label_set[key], labels))
-
-        class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-        class_weights = torch.tensor(class_weights, dtype=torch.float)
-
-        return train_iter, test_iter, class_weights
+if __name__ == "__main__":
+    # export LD_LIBRARY_PATH=/root/miniconda3/envs/bert-classifier/lib:$LD_LIBRARY_PATH
+    # python data.py -f "/root/autodl-tmp/BertClassifier/dataset/News_Category_Dataset_v3.json" -t "/root/models/bert-base-uncased"
+    main()

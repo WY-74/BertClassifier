@@ -43,7 +43,7 @@ class _FineTuningBertBase(_Train):
     def init_weights(self, m):
         if type(m) == nn.Linear:
             nn.init.kaiming_uniform_(m.weight)
-        
+
     def train_epochs(self, num_epochs, train_iter, test_iter):
         timer, num_batches = Timer(), len(train_iter)
         animator = Animator(
@@ -62,7 +62,7 @@ class _FineTuningBertBase(_Train):
 
                 self.optimizer.zero_grad()
                 pred = self.net(*X)
-                l = self.loss(pred, y) # mean
+                l = self.loss(pred, y)  # mean
                 l.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 self.optimizer.step()
@@ -83,7 +83,7 @@ class _FineTuningBertBase(_Train):
                     for param_group in self.optimizer.param_groups:
                         param_group['lr'] = self.scheduler(epoch, param_group)
 
-        print(f'loss {metric[0] / metric[2]:.3f}, train acc {metric[1] / metric[3]}, test acc {test_acc:.3f}')
+        print(f'loss {metric[0] / metric[2]:.3f}, train acc {metric[1] / metric[3]:.3f}, test acc {test_acc:.3f}')
         print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on ' f'{str(self.devices)}')
 
 

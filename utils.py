@@ -1,10 +1,13 @@
 import time
 import torch
+import random
 from torch import nn
 from tqdm import tqdm
 from IPython import display
 from typing import Tuple, List
 from matplotlib import pyplot as plt
+from nlpaug.augmenter import word as naw
+from transformers import pipeline
 from matplotlib_inline import backend_inline
 from sklearn.metrics import classification_report
 
@@ -13,20 +16,21 @@ def f1_report(net, test_iter):
     y_true = []
     y_pred = []
     device = next(net.parameters()).device
-    
+
     for features, labels in tqdm(test_iter):
         if isinstance(features, list):
             X = [x.to(device) for x in features]
         else:
             X = features.to(device)
         y = labels.to(device)
-    
+
         outputs = net(*X)
         outputs = outputs.argmax(axis=1)
         y_true.extend(labels.cpu().numpy())
         y_pred.extend(outputs.cpu().numpy())
-    
+
     print(classification_report(y_true, y_pred))
+
 
 def accuracy(y_hat, y) -> float:
     """计算预测正确的数量"""
